@@ -33,10 +33,15 @@ var usageLines = []string{
 	"  refresh [alias|--all] [--quiet]         warm tokens, update cached state",
 	"",
 	"ONBOARDING",
-	"  login [--alias A] [--preset P] [--scopes S] [--project X]",
-	"  rescope <alias> [--add S] [--set S] [--preset P]",
+	"  login [--alias A] [--preset P] [--scopes S] [--project X] [--sdk-client]",
+	"  rescope <alias> [--add S] [--set S] [--preset P] [--sdk-client]",
+	"  set <alias> [--project P] [--quota-project P]   edit defaults, no re-consent",
 	"  adopt --alias A --file PATH             import an existing credential file",
 	"  adopt --scan                            list credential files found on this host",
+	"",
+	"  --sdk-client mints through 'gcloud auth login' instead of the",
+	"  application-default flow. Different OAuth client, fixed scope set, and the",
+	"  one that still works when a Workspace tenant blocks Drive consent.",
 	"",
 	"LIFECYCLE",
 	"  archive <alias>                         retire, keep for audit, free the alias",
@@ -99,6 +104,8 @@ func Run(args []string) int {
 		return cmdLogin(rest)
 	case "rescope":
 		return cmdRescope(rest)
+	case "set":
+		return cmdSet(rest)
 	case "adopt":
 		return cmdAdopt(rest)
 	case "archive":
@@ -235,6 +242,20 @@ func joinShort(list []string, max int) string {
 		return "-"
 	}
 	return strings.Join(s, ",")
+}
+
+// driveScope is the full-access Drive scope. BigQuery federation to a Sheet
+// authenticates with this one, not with the Sheets scope, which is the detail
+// that makes "add sheets" the wrong fix for a failing dbt model.
+const driveScope = "https://www.googleapis.com/auth/drive"
+
+func hasScope(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func dash(s string) string {

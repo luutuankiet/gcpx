@@ -84,6 +84,84 @@ func probeProjects(ctx context.Context, token string) []string {
 	return out
 }
 
+// mintResult is one completed consent flow, already introspected.
+type mintResult struct {
+	raw     []byte
+	email   string
+	granted []string
+	token   string
+	usedSDK bool
+}
+
+// mintAndVerify runs a consent flow and checks what Google actually granted.
+//
+// The fallback logic exists because a tenant-side block is invisible from
+// here: gcloud reports success, and the only trace is that the Drive scope
+// asked for never appears on the resulting token. That signature is specific
+// enough to act on, and the SDK OAuth client is the one route that gets past
+// it, so it is offered by name rather than left as a puzzle.
+func mintAndVerify(ctx context.Context, want []string, useSDK bool) (mintResult, error) {
+	var res mintResult
+	res.usedSDK = useSDK
+
+	var raw []byte
+	var err error
+	if useSDK {
+		fmt.Fprintf(os.Stderr, "Minting through the SDK OAuth client (gcloud auth login).\n")
+		fmt.Fprintf(os.Stderr, "Scopes are fixed on this route: %s\n\n", strings.Join(scopes.ShortAll(auth.SDKLoginScopes), ", "))
+		raw, err = auth.MintSDK(ctx, os.Stdin, os.Stderr)
+	} else {
+		fmt.Fprintf(os.Stderr, "Requesting scopes: %s\n\n", strings.Join(scopes.ShortAll(want), ", "))
+		raw, err = auth.Mint(ctx, want, os.Stdin, os.Stderr)
+	}
+	if err != nil {
+		if !useSDK && hasScope(want, driveScope) {
+			warnf("the application-default consent flow failed while asking for Drive. Some Workspace tenants block that OAuth client for Drive specifically. Retry with --sdk-client to mint through 'gcloud auth login' instead.")
+		}
+		return res, err
+	}
+	res.raw = raw
+	res.email, res.granted, res.token, err = verify(ctx, raw)
+	if err != nil {
+		return res, fmt.Errorf("minted credential failed verification: %w", err)
+	}
+
+	if !useSDK && hasScope(want, driveScope) && !hasScope(res.granted, driveScope) {
+		warnf("Drive was requested but not granted. That is the signature of a Workspace tenant blocking this OAuth client's Drive consent screen, not of a wrong scope name.")
+		if isTTY() {
+			ans, aerr := ask("Retry through the SDK OAuth client now? [y/N]: ", "--sdk-client")
+			if aerr == nil && strings.EqualFold(strings.TrimSpace(ans), "y") {
+				return mintAndVerify(ctx, want, true)
+			}
+		} else {
+			warnf("re-run with --sdk-client to take the route that is usually still permitted")
+		}
+	}
+	return res, nil
+}
+
+// stampQuotaProject attaches a quota project to freshly minted credentials
+// that need one.
+//
+// Doing it at mint time closes an entire class of later failure: without it,
+// the first Drive or Sheets call returns a 403 whose text reads like a
+// permissions problem, sending the reader to the IAM console for something
+// that was only ever a missing line in a local file.
+func stampQuotaProject(raw []byte, project string) ([]byte, string) {
+	if project == "" {
+		return raw, ""
+	}
+	adc, err := auth.ParseADC(raw)
+	if err != nil || !auth.NeedsQuotaProject(adc.ClientID) || adc.QuotaProjectID != "" {
+		return raw, adc.QuotaProjectID
+	}
+	patched, err := auth.SetQuotaProject(raw, project)
+	if err != nil {
+		return raw, ""
+	}
+	return patched, project
+}
+
 func cmdLogin(args []string) int {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -94,6 +172,7 @@ func cmdLogin(args []string) int {
 	desc := fs.String("description", "", "free text describing what this identity is for")
 	tags := fs.String("tags", "", "comma-separated tags")
 	yes := fs.Bool("yes", false, "accept defaults instead of prompting")
+	sdkClient := fs.Bool("sdk-client", false, "mint via 'gcloud auth login' (different OAuth client, fixed scopes, survives Drive consent blocks)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -116,16 +195,11 @@ func cmdLogin(args []string) int {
 		return errf("%v", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Requesting scopes: %s\n\n", strings.Join(scopes.ShortAll(want), ", "))
-	raw, err := auth.Mint(ctx, want, os.Stdin, os.Stderr)
+	res, err := mintAndVerify(ctx, want, *sdkClient)
 	if err != nil {
 		return errf("%v", err)
 	}
-
-	email, granted, token, err := verify(ctx, raw)
-	if err != nil {
-		return errf("minted credential failed verification: %v", err)
-	}
+	raw, email, granted, token := res.raw, res.email, res.granted, res.token
 	fmt.Fprintf(os.Stderr, "\n  identity  %s\n", dash(email))
 	fmt.Fprintf(os.Stderr, "  granted   %s\n", strings.Join(scopes.ShortAll(granted), ", "))
 	if missing := scopes.Missing(want, granted); len(missing) > 0 {
@@ -203,6 +277,11 @@ func cmdLogin(args []string) int {
 		}
 	}
 
+	raw, quota := stampQuotaProject(raw, finalProject)
+	if quota != "" {
+		fmt.Fprintf(os.Stderr, "  quota     %s (this OAuth client must name a project to bill Drive and Sheets calls to)\n", quota)
+	}
+
 	id := store.Identity{
 		Alias:          finalAlias,
 		Email:          email,
@@ -251,6 +330,7 @@ func cmdRescope(args []string) int {
 	add := fs.String("add", "", "scopes to add to the existing set")
 	set := fs.String("set", "", "replace the scope set entirely")
 	preset := fs.String("preset", "", "replace the scope set with a preset")
+	sdkClient := fs.Bool("sdk-client", false, "mint via 'gcloud auth login' (different OAuth client, fixed scopes, survives Drive consent blocks)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -269,22 +349,20 @@ func cmdRescope(args []string) int {
 		}
 	case *add != "":
 		want = scopes.Union(id.Scopes, scopes.Parse(*add))
+	case *sdkClient:
+		want = auth.SDKLoginScopes
 	default:
-		return errf("nothing to change: pass --add, --set or --preset")
+		return errf("nothing to change: pass --add, --set, --preset or --sdk-client")
 	}
 
 	fmt.Fprintf(os.Stderr, "Re-minting %s. Scopes are fixed at consent, so this needs a fresh browser approval.\n", alias)
-	fmt.Fprintf(os.Stderr, "Requesting: %s\n\n", strings.Join(scopes.ShortAll(want), ", "))
 
 	ctx := context.Background()
-	raw, err := auth.Mint(ctx, want, os.Stdin, os.Stderr)
+	res, err := mintAndVerify(ctx, want, *sdkClient)
 	if err != nil {
 		return errf("%v", err)
 	}
-	email, granted, token, err := verify(ctx, raw)
-	if err != nil {
-		return errf("minted credential failed verification: %v", err)
-	}
+	raw, email, granted, token := res.raw, res.email, res.granted, res.token
 	if id.Email != "" && email != "" && !strings.EqualFold(id.Email, email) {
 		warnf("signed in as %s but %q previously held %s. Overwriting.", email, alias, id.Email)
 	}
@@ -299,6 +377,10 @@ func cmdRescope(args []string) int {
 	id.State = store.StateActive
 	if p := probeProjects(ctx, token); len(p) > 0 {
 		id.KnownProjects = p
+	}
+	raw, quota := stampQuotaProject(raw, id.DefaultProject)
+	if quota != "" {
+		fmt.Fprintf(os.Stderr, "quota project kept at %s\n", quota)
 	}
 	if err := store.SaveADC(alias, raw); err != nil {
 		return errf("%v", err)
@@ -368,6 +450,11 @@ func cmdAdopt(args []string) int {
 	}
 	if scopes.WeakDrive(granted) {
 		warnf("%s holds drive.file only, which cannot open pre-existing Sheets. Fix: gcpx rescope %s --add drive", finalAlias, finalAlias)
+	}
+	var quota string
+	raw, quota = stampQuotaProject(raw, *project)
+	if quota != "" {
+		fmt.Fprintf(os.Stderr, "quota project set to %s (this OAuth client needs one for Drive and Sheets)\n", quota)
 	}
 	if !scopes.CanSelfIdentify(granted) {
 		warnf("%s cannot report its own account: it was minted without userinfo.email. Usable, but it will show a blank email everywhere. Fix: gcpx rescope %s --add email", finalAlias, finalAlias)

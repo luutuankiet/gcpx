@@ -48,8 +48,9 @@ gcpx exec work -- bq query 'select 1'
 | `ls [--json] [--wide] [--all]` | identities, states, next actions |
 | `doctor [alias\|--all] [--json]` | live probe, plus which credential source wins on this host |
 | `refresh [alias\|--all] [--quiet]` | warm tokens, update cached state |
-| `login [--alias] [--preset] [--scopes] [--project]` | mint through the browser |
-| `rescope <alias> --add drive` | re-mint with wider scopes, alias preserved |
+| `login [--alias] [--preset] [--scopes] [--project] [--sdk-client]` | mint through the browser |
+| `rescope <alias> --add drive [--sdk-client]` | re-mint with wider scopes, alias preserved |
+| `set <alias> [--project P] [--quota-project P]` | edit defaults without re-consenting |
 | `adopt --alias A --file PATH` | import a credential that already exists |
 | `archive <alias>` / `rm <alias>` | retire, or delete |
 | `export <alias>` / `import --bundle F` | move an identity to another host, sealed |
@@ -93,6 +94,37 @@ Every mint force-includes `openid`, `userinfo.email` and `cloud-platform`. The f
 **`drive.file` is not a substitute for `drive`.** It grants access only to files this OAuth client itself created, so it fails on a pre-existing Sheet while still looking like "a Drive scope" is present. gcpx flags it explicitly.
 
 Scopes are frozen at consent time. There is no API to widen an existing grant, so `rescope` re-mints — the command is named for what it actually does.
+
+## Two OAuth clients, and why Drive fails
+
+`gcloud auth login` and `gcloud auth application-default login` do not use the same OAuth client. Nothing in either command's output says so, and the two credential files look identical apart from one opaque numeric id. That difference decides three things:
+
+| | SDK client (`gcloud auth login`) | Auth-library client (`application-default login`) |
+|---|---|---|
+| Scope control | fixed set, no `--scopes` flag | any scopes you ask for |
+| Quota project | not required | **required** for Drive, Sheets and other non-Cloud APIs |
+| Drive consent | usually allowlisted | some Workspace tenants block it outright |
+
+Two credentials can therefore carry byte-identical scope lists and still behave differently. gcpx covers both halves:
+
+```bash
+# Tenant blocks the default flow's Drive consent screen.
+gcpx login --alias work --sdk-client
+
+# Drive answers 403 with wording about permissions; the real cause is a
+# missing quota project. No re-consent needed.
+gcpx set work --quota-project auto
+```
+
+`login` stamps the quota project automatically when the credential needs one, so this is mostly a repair path for identities minted before that existed. When a mint asks for Drive and Google grants everything except Drive, gcpx names that as a tenant-side block and offers the SDK route rather than leaving a scope list to squint at.
+
+`doctor` reports which client minted each identity, what quota project is attached, and a live Drive call with the failing layer named:
+
+```
+  work
+    client   auth-library
+    quota    NOT SET - Drive and Sheets will refuse this credential. Fix: gcpx set work --quota-project auto
+```
 
 ## Moving an identity between hosts
 

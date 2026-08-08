@@ -75,13 +75,31 @@ func sources() []credSource {
 }
 
 type doctorReport struct {
-	Version   string          `json:"gcpx_version"`
-	Store     string          `json:"store"`
-	Gcloud    string          `json:"gcloud,omitempty"`
-	Sources   []credSource    `json:"credential_sources"`
-	Cron      string          `json:"cron,omitempty"`
-	Results   []health.Result `json:"identities,omitempty"`
-	CheckedAt time.Time       `json:"checked_at"`
+	Version   string            `json:"gcpx_version"`
+	Store     string            `json:"store"`
+	Gcloud    string            `json:"gcloud,omitempty"`
+	Sources   []credSource      `json:"credential_sources"`
+	Cron      string            `json:"cron,omitempty"`
+	Results   []health.Result   `json:"identities,omitempty"`
+	Drive     map[string]string `json:"drive_probe,omitempty"`
+	CheckedAt time.Time         `json:"checked_at"`
+}
+
+// probeDrive answers what a scope list cannot: whether this credential opens a
+// Drive file right now. Scope, quota project and Drive's own sharing rules all
+// deny with the same status code, so the only honest report is a live call.
+func probeDrive(ctx context.Context, alias, token string) string {
+	raw, err := store.LoadADC(alias)
+	if err != nil {
+		return ""
+	}
+	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	code, body, err := auth.DriveProbe(pctx, token, auth.QuotaProject(raw))
+	if err != nil {
+		return "probe failed: " + err.Error()
+	}
+	return auth.ExplainDrive(alias, code, body)
 }
 
 func cmdDoctor(args []string) int {
@@ -121,16 +139,23 @@ func cmdDoctor(args []string) int {
 	}
 
 	worst := 0
+	driveNotes := map[string]string{}
 	for _, id := range ids {
 		r := health.Check(ctx, id)
 		health.Apply(&id, r)
 		_ = store.Save(id)
+		// Probed while the token is still in hand, since it is scrubbed from the
+		// report immediately afterwards.
+		if r.AccessToken != "" && hasScope(r.Granted, driveScope) {
+			driveNotes[r.Alias] = probeDrive(ctx, r.Alias, r.AccessToken)
+		}
 		r.AccessToken = ""
 		rep.Results = append(rep.Results, r)
 		if c := health.ExitCode(r.State); c > worst {
 			worst = c
 		}
 	}
+	rep.Drive = driveNotes
 
 	if *asJSON {
 		if emitJSON(rep) != 0 {
@@ -184,6 +209,21 @@ func cmdDoctor(args []string) int {
 		fmt.Printf("    state    %s\n", strings.ToUpper(r.State))
 		fmt.Printf("    email    %s\n", dash(r.Email))
 		fmt.Printf("    project  %s\n", dash(r.Project))
+		if raw, err := store.LoadADC(r.Alias); err == nil {
+			adc, perr := auth.ParseADC(raw)
+			if perr == nil {
+				fmt.Printf("    client   %s\n", auth.ClientKind(adc.ClientID))
+				switch {
+				case adc.QuotaProjectID != "":
+					fmt.Printf("    quota    %s\n", adc.QuotaProjectID)
+				case auth.NeedsQuotaProject(adc.ClientID):
+					fmt.Printf("    quota    NOT SET - Drive and Sheets will refuse this credential. Fix: gcpx set %s --quota-project auto\n", r.Alias)
+				}
+			}
+		}
+		if note := driveNotes[r.Alias]; note != "" {
+			fmt.Printf("    drive    %s\n", note)
+		}
 		if len(r.Granted) > 0 {
 			fmt.Printf("    granted  %s\n", strings.Join(scopes.ShortAll(r.Granted), ", "))
 		}

@@ -265,3 +265,199 @@ func WellKnownADC() string {
 	}
 	return filepath.Join(h, ".config", "gcloud", "application_default_credentials.json")
 }
+
+// OAuth client lineage.
+//
+// A credential's client_id decides two things no other field reveals: whether
+// a Workspace tenant will show a Drive consent screen for it at all, and
+// whether Google demands a quota project on every non-Cloud API call. Two
+// credentials with byte-identical scope lists behave differently on both
+// counts purely because of which command minted them.
+const (
+	// SDKClientPrefix is the shared Google Cloud SDK client, carried by
+	// credentials from `gcloud auth login`. Exempt from the quota-project rule
+	// and allowlisted by default in most Workspace tenants.
+	SDKClientPrefix = "32555940559"
+	// AuthLibraryClientPrefix is the client `gcloud auth application-default
+	// login` uses. Subject to the quota-project rule, and some tenants block
+	// its Drive consent screen outright.
+	AuthLibraryClientPrefix = "764086051850"
+)
+
+// ClientKind names the OAuth client that minted a credential.
+func ClientKind(clientID string) string {
+	switch {
+	case clientID == "":
+		return "unknown"
+	case strings.HasPrefix(clientID, SDKClientPrefix):
+		return "sdk"
+	case strings.HasPrefix(clientID, AuthLibraryClientPrefix):
+		return "auth-library"
+	default:
+		return "custom"
+	}
+}
+
+// NeedsQuotaProject reports whether Google will reject this credential's
+// non-Cloud API calls until a quota project is attached. Only the SDK client
+// is exempt.
+func NeedsQuotaProject(clientID string) bool {
+	return ClientKind(clientID) != "sdk"
+}
+
+// SDKLoginScopes is what `gcloud auth login --enable-gdrive-access` grants.
+// The set is fixed: that command has no --scopes flag, so a caller taking the
+// SDK route trades scope control for a consent screen that is far more likely
+// to be permitted.
+var SDKLoginScopes = []string{
+	"openid",
+	"https://www.googleapis.com/auth/userinfo.email",
+	"https://www.googleapis.com/auth/cloud-platform",
+	"https://www.googleapis.com/auth/appengine.admin",
+	"https://www.googleapis.com/auth/compute",
+	"https://www.googleapis.com/auth/sqlservice.login",
+	"https://www.googleapis.com/auth/accounts.reauth",
+	"https://www.googleapis.com/auth/drive",
+}
+
+// MintSDK mints through `gcloud auth login --update-adc` rather than the
+// application-default flow.
+//
+// Same throwaway CLOUDSDK_CONFIG discipline as Mint, for the same reason: the
+// caller's real credential file must not be clobbered. The difference that
+// matters is the OAuth client, which is not selectable on either command --
+// choosing the command is the only way to choose the client.
+func MintSDK(ctx context.Context, stdin io.Reader, progress io.Writer) ([]byte, error) {
+	g, err := GcloudPath()
+	if err != nil {
+		return nil, err
+	}
+	tmp, err := os.MkdirTemp("", "gcpx-mint-sdk-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp)
+
+	args := []string{
+		"auth", "login",
+		"--no-launch-browser",
+		"--enable-gdrive-access",
+		"--update-adc",
+		"--brief",
+	}
+	cmd := exec.CommandContext(ctx, g, args...)
+	cmd.Env = append(os.Environ(),
+		"CLOUDSDK_CONFIG="+tmp,
+		"CLOUDSDK_CORE_DISABLE_PROMPTS=0",
+	)
+	cmd.Stdin = stdin
+	cmd.Stdout = progress
+	cmd.Stderr = progress
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gcloud auth login failed: %w", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "application_default_credentials.json"))
+	if err != nil {
+		return nil, fmt.Errorf("gcloud reported success but wrote no ADC file; this gcloud may predate --update-adc: %w", err)
+	}
+	if _, err := ParseADC(raw); err != nil {
+		return nil, fmt.Errorf("minted credential rejected: %w", err)
+	}
+	return raw, nil
+}
+
+// QuotaProject reads the quota project out of raw credential bytes.
+func QuotaProject(raw []byte) string {
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	s, _ := m["quota_project_id"].(string)
+	return s
+}
+
+// SetQuotaProject rewrites the quota project inside raw credential bytes.
+//
+// Deliberately map-based rather than struct-based: Google adds fields to this
+// file format without notice, and a struct round-trip would silently drop any
+// field gcpx does not know about.
+func SetQuotaProject(raw []byte, project string) ([]byte, error) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("not valid JSON: %w", err)
+	}
+	if project == "" {
+		delete(m, "quota_project_id")
+	} else {
+		m["quota_project_id"] = project
+	}
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
+}
+
+const driveFilesEndpoint = "https://www.googleapis.com/drive/v3/files"
+
+// DriveProbe issues the cheapest Drive call there is and returns the raw
+// outcome for ExplainDrive to interpret.
+//
+// The quota-project header is sent explicitly because that is what a client
+// library does once quota_project_id is present in the credential file. A bare
+// curl never reads the credential file, so a probe without this header tests
+// something no real caller experiences.
+func DriveProbe(ctx context.Context, accessToken, quotaProject string) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, driveFilesEndpoint+"?pageSize=1&fields=files(id)", nil)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if quotaProject != "" {
+		req.Header.Set("x-goog-user-project", quotaProject)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, string(b), nil
+}
+
+// ExplainDrive names which gate a Drive failure came from.
+//
+// Three independent systems can deny the same call -- the OAuth scope on the
+// token, the quota project billed for the call, and Drive's own file sharing.
+// Google answers 403 for all three with wording that reads like an IAM problem
+// in every case, which is what sends people to the permissions console when
+// the real fix is one line of local config.
+func ExplainDrive(alias string, status int, body string) string {
+	if status == http.StatusOK {
+		return "ok - this credential can read Drive right now"
+	}
+	low := strings.ToLower(body)
+	switch {
+	case strings.Contains(low, "requires a quota project"):
+		return fmt.Sprintf("quota-project layer, NOT scopes. This credential's OAuth client must name a project to bill Drive calls to. Fix: gcpx set %s --quota-project auto", alias)
+	case strings.Contains(low, "serviceusage.services.use"), strings.Contains(low, "user_project_denied"):
+		return "quota-project layer: this account may not bill against the project currently set as quota project. No local fix -- it needs roles/serviceusage.serviceUsageConsumer there, or point --quota-project at a project where it already has that."
+	case strings.Contains(low, "insufficient authentication scopes"), status == http.StatusUnauthorized:
+		return fmt.Sprintf("scope layer: no drive scope on this credential. Fix: gcpx rescope %s --add drive (add --sdk-client if the consent screen is blocked)", alias)
+	case strings.Contains(low, "has not been used in project"), strings.Contains(low, "is disabled"):
+		return "API-enablement layer: the Drive API is switched off in the quota project. Fix: enable drive.googleapis.com there."
+	default:
+		return fmt.Sprintf("HTTP %d: %s", status, firstLine(body))
+	}
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 200 {
+		s = s[:200] + "..."
+	}
+	return s
+}

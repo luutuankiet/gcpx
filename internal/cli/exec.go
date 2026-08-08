@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/luutuankiet/gcpx/internal/auth"
 	"github.com/luutuankiet/gcpx/internal/health"
 	"github.com/luutuankiet/gcpx/internal/store"
 )
@@ -86,6 +87,23 @@ func warnIfUnhealthy(id store.Identity) {
 		warnf("identity %q was last seen EXPIRED. Fix: %s", id.Alias, health.CachedNextAction(id))
 	case store.StateScopeGap:
 		warnf("identity %q was last seen SCOPE-GAP. Fix: %s", id.Alias, health.CachedNextAction(id))
+	}
+	// A missing quota project stays invisible until some Drive or Sheets call
+	// fails much later with wording that points at permissions. One small file
+	// read here converts that into a named problem before the command runs.
+	if !hasScope(id.Scopes, driveScope) {
+		return
+	}
+	raw, err := store.LoadADC(id.Alias)
+	if err != nil {
+		return
+	}
+	adc, err := auth.ParseADC(raw)
+	if err != nil {
+		return
+	}
+	if auth.NeedsQuotaProject(adc.ClientID) && adc.QuotaProjectID == "" {
+		warnf("identity %q has drive scope but no quota project, so Drive and Sheets will refuse it with a permissions-shaped 403. Fix: gcpx set %s --quota-project auto", id.Alias, id.Alias)
 	}
 }
 
