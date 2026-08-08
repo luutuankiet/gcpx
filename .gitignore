@@ -1,0 +1,7 @@
+bin/
+dist/
+gsd-lite/
+*.adc.json
+*.bundle
+*.gcpx
+.DS_Store

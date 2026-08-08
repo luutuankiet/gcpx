@@ -1,0 +1,35 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Verify release notes file exists
+        run: |
+          NOTES_FILE="releases/${{ github.ref_name }}.md"
+          if [ ! -f "$NOTES_FILE" ]; then
+            echo "::error::Missing $NOTES_FILE."
+            exit 1
+          fi
+      - name: Setup Go (inline - avoid actions/setup-go codeload flake)
+        run: |
+          set -euo pipefail
+          GO_VERSION=1.25.3
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | sudo tar -C /usr/local -xz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      - name: Install GoReleaser (inline - avoid goreleaser-action codeload flake)
+        run: |
+          set -euo pipefail
+          GORELEASER_VERSION=2.16.0
+          curl -fsSL "https://github.com/goreleaser/goreleaser/releases/download/v${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz" | sudo tar -C /usr/local/bin -xz goreleaser
+      - name: GoReleaser release
+        run: goreleaser release --clean --release-notes=releases/${{ github.ref_name }}.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
