@@ -312,6 +312,7 @@ func cmdLogin(args []string) int {
 	}
 	fmt.Printf("Saved %s (%s)\n", finalAlias, dash(email))
 	fmt.Printf("Try:  gcpx exec %s -- gcloud auth print-access-token\n", finalAlias)
+	offerPush(finalAlias)
 	return 0
 }
 
@@ -389,6 +390,7 @@ func cmdRescope(args []string) int {
 		return errf("%v", err)
 	}
 	fmt.Printf("Rescoped %s: %s\n", alias, strings.Join(scopes.ShortAll(id.Scopes), ", "))
+	offerPush(alias)
 	return 0
 }
 
@@ -466,6 +468,7 @@ func cmdAdopt(args []string) int {
 		return errf("%v", err)
 	}
 	fmt.Printf("Adopted %s (%s)\n", finalAlias, dash(email))
+	offerPush(finalAlias)
 	return 0
 }
 

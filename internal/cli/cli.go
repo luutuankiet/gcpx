@@ -48,6 +48,12 @@ var usageLines = []string{
 	"  rm <alias>                              delete outright",
 	"  export <alias> [--out FILE]             sealed bundle for another host",
 	"  import --bundle FILE [--alias A]        install a sealed bundle",
+	"  push <alias> [--to h1,h2] [--dry-run]   send this credential to other hosts",
+	"  fleet [ls|add <ssh-host>|rm <ssh-host>] hosts that mirror these identities",
+	"",
+	"  Consent is granted per account, not per machine: re-consenting anywhere",
+	"  supersedes the credential everywhere. push re-syncs the fleet in one step,",
+	"  and login/rescope/adopt offer to run it for you.",
 	"",
 	"BACKGROUND",
 	"  schedule install|uninstall|status|print [--interval CRON]",
@@ -116,6 +122,10 @@ func Run(args []string) int {
 		return cmdExport(rest)
 	case "import":
 		return cmdImport(rest)
+	case "push":
+		return cmdPush(rest)
+	case "fleet":
+		return cmdFleet(rest)
 	case "schedule":
 		return cmdSchedule(rest)
 	case "self-update":

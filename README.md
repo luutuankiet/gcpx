@@ -54,6 +54,8 @@ gcpx exec work -- bq query 'select 1'
 | `adopt --alias A --file PATH` | import a credential that already exists |
 | `archive <alias>` / `rm <alias>` | retire, or delete |
 | `export <alias>` / `import --bundle F` | move an identity to another host, sealed |
+| `push <alias> [--to h1,h2]` | re-sync this credential to the other hosts that hold it |
+| `fleet [ls\|add\|rm] <ssh-host>` | which hosts mirror these identities |
 | `schedule install\|uninstall\|status` | background refresh via crontab |
 | `self-update [--check]` | replace this binary with the latest release |
 
@@ -130,12 +132,29 @@ gcpx set work --quota-project auto
 
 Mint once, distribute the file. Refresh tokens are portable, and Google caps them at 100 per account per OAuth client, silently invalidating the oldest past that — so minting separately on every host burns slots for no benefit.
 
+Register the hosts once, then one command keeps them in step:
+
+```bash
+gcpx fleet add box-a box-b       # ssh destinations, no secrets stored
+gcpx push work                   # stream the live credential to each
+```
+
+`push` streams an unsealed bundle over ssh stdin. Nothing is written to disk on either end and no passphrase appears on a remote command line, where any local `ps` would read it — ssh is already the encrypted channel, so a second layer would only move the secret somewhere worse.
+
+For a channel gcpx does not control — a paste buffer, a chat window, an agent transcript — use the sealed file instead:
+
 ```bash
 gcpx export work --out work.gcpx     # on the host that minted
 gcpx import --bundle work.gcpx       # on each target
 ```
 
-Bundles are encrypted with AES-256-GCM under a PBKDF2 passphrase by default. This is not ceremony: what crosses the wire is a live OAuth refresh token, and the transport is often a paste buffer or an agent transcript. `--plaintext` exists and warns loudly.
+Bundles are encrypted with AES-256-GCM under a PBKDF2 passphrase by default. This is not ceremony: what crosses the wire is a live OAuth refresh token. `--plaintext` exists and warns loudly.
+
+### Why push exists
+
+Consent is granted per account and OAuth client, never per machine. Approving a new scope set **replaces** the grant, and every other host still holding the previous refresh token is left with a receipt for an authorization that no longer exists. Those hosts cannot detect this: the file is intact, the daemon keeps running, and calls simply start failing as if the account had been revoked.
+
+This is why `login`, `rescope` and `adopt` end by naming the hosts they just invalidated and offering to push. Steady-state sharing is safe — any number of machines can refresh the same token concurrently, indefinitely — so the only moment that needs a human is the moment the grant changes.
 
 ## Background refresh
 
