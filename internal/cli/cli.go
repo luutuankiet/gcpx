@@ -49,7 +49,7 @@ var usageLines = []string{
 	"  export <alias> [--out FILE]             sealed bundle for another host",
 	"  import --bundle FILE [--alias A]        install a sealed bundle",
 	"  push <alias> [--to h1,h2] [--dry-run]   send this credential to other hosts",
-	"  fleet [ls|add <ssh-host>|rm <ssh-host>] hosts that mirror these identities",
+	"  fleet [ls|discover|self <name>|add|rm]  peers that mirror these identities",
 	"",
 	"  Consent is granted per account, not per machine: re-consenting anywhere",
 	"  supersedes the credential everywhere. push re-syncs the fleet in one step,",

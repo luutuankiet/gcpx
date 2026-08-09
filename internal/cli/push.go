@@ -19,27 +19,33 @@ import (
 // rather than part of the credential store.
 func fleetPath() string { return filepath.Join(store.DataDir(), "fleet.json") }
 
+// fleetFile is deliberately per-host and self-contained. There is no
+// coordinating node: each machine records who it can reach and what the others
+// call it, which is the only state a peer-to-peer copy actually needs.
 type fleetFile struct {
+	Self  string   `json:"self,omitempty"`
 	Hosts []string `json:"hosts"`
 }
 
-func loadFleet() []string {
+func loadFleetFile() fleetFile {
+	var f fleetFile
 	raw, err := os.ReadFile(fleetPath())
 	if err != nil {
-		return nil
+		return f
 	}
-	var f fleetFile
 	if json.Unmarshal(raw, &f) != nil {
-		return nil
+		return fleetFile{}
 	}
-	return f.Hosts
+	return f
 }
 
-func saveFleet(hosts []string) error {
+func loadFleet() []string { return loadFleetFile().Hosts }
+
+func saveFleet(f fleetFile) error {
 	if err := store.EnsureDirs(); err != nil {
 		return err
 	}
-	out, err := json.MarshalIndent(fleetFile{Hosts: hosts}, "", "  ")
+	out, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -67,18 +73,19 @@ func splitHosts(s string) []string {
 
 // otherHosts drops this machine from a target list.
 //
-// Pushing to yourself is harmless but reads as a bug in the output, and the
-// same fleet file is meant to be copied verbatim to every host, so each one
-// has to be able to recognise itself in it.
+// Hostnames are close to useless for this. An ssh destination is a human's
+// name for a box and routinely bears no relation to what the box calls itself,
+// so the machine's own name in the mesh is recorded explicitly and the
+// hostname is only a fallback for when the two happen to agree.
 func otherHosts(list []string) []string {
-	self, _ := os.Hostname()
-	short := self
-	if i := strings.IndexByte(short, '.'); i > 0 {
-		short = short[:i]
+	self := loadFleetFile().Self
+	host, _ := os.Hostname()
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		host = host[:i]
 	}
 	var out []string
 	for _, h := range list {
-		if h == self || h == short {
+		if h == self || (self == "" && h == host) {
 			continue
 		}
 		out = append(out, h)
@@ -86,31 +93,121 @@ func otherHosts(list []string) []string {
 	return out
 }
 
+// sshConfigHosts reads plain Host entries out of the user's ssh config.
+//
+// Discovery reuses what the operator already maintains rather than asking them
+// to restate it. Patterns and negations are skipped: a wildcard is not a
+// machine anyone can push to.
+func sshConfigHosts() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".ssh", "config"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "host") {
+			continue
+		}
+		for _, h := range fields[1:] {
+			if strings.ContainsAny(h, "*?!") || hasString(out, h) {
+				continue
+			}
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// discoverPeers probes candidates for a working gcpx and returns the ones that
+// answer. Probes run concurrently because an unreachable host costs the full
+// connect timeout and a serial sweep of a stale ssh config takes minutes.
+func discoverPeers(candidates []string) []string {
+	type result struct {
+		host string
+		ok   bool
+	}
+	ch := make(chan result, len(candidates))
+	for _, h := range candidates {
+		go func(h string) {
+			cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", h,
+				`export PATH="$HOME/.local/bin:$PATH"; exec gcpx version`)
+			out, err := cmd.Output()
+			ch <- result{h, err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), "gcpx")}
+		}(h)
+	}
+	found := map[string]bool{}
+	for range candidates {
+		r := <-ch
+		if r.ok {
+			found[r.host] = true
+		}
+	}
+	var out []string
+	for _, h := range candidates {
+		if found[h] {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 func cmdFleet(args []string) int {
-	hosts := loadFleet()
+	f := loadFleetFile()
 	if len(args) == 0 || args[0] == "ls" || args[0] == "list" {
-		if len(hosts) == 0 {
-			fmt.Println("No hosts registered. Add one with: gcpx fleet add <ssh-host>")
+		if len(f.Hosts) == 0 {
+			fmt.Println("No peers known. Find them with: gcpx fleet discover")
 			return 0
 		}
-		self, _ := os.Hostname()
-		for _, h := range hosts {
+		w := table()
+		for _, h := range f.Hosts {
 			mark := ""
 			if len(otherHosts([]string{h})) == 0 {
-				mark = "  (this host: " + self + ")"
+				mark = "this host"
 			}
-			fmt.Println(h + mark)
+			fmt.Fprintf(w, "%s\t%s\n", h, mark)
+		}
+		w.Flush()
+		if f.Self == "" {
+			warnf("this host has no name in the mesh, so push would try to ssh to itself. Fix: gcpx fleet self <name the others use for this box>")
 		}
 		return 0
 	}
 	switch args[0] {
+	case "self":
+		if len(args) < 2 {
+			return errf("usage: gcpx fleet self <ssh-name-of-this-host>")
+		}
+		f.Self = args[1]
+		if !hasString(f.Hosts, f.Self) {
+			f.Hosts = append(f.Hosts, f.Self)
+		}
+	case "discover":
+		candidates := sshConfigHosts()
+		if len(candidates) == 0 {
+			return errf("no Host entries in ~/.ssh/config to probe; add peers by name with 'gcpx fleet add'")
+		}
+		fmt.Fprintf(os.Stderr, "probing %d ssh destination(s) for gcpx...\n", len(candidates))
+		found := discoverPeers(candidates)
+		if len(found) == 0 {
+			return errf("none of the %d destinations answered with a gcpx", len(candidates))
+		}
+		for _, h := range found {
+			if !hasString(f.Hosts, h) {
+				f.Hosts = append(f.Hosts, h)
+			}
+		}
 	case "add":
 		if len(args) < 2 {
 			return errf("usage: gcpx fleet add <ssh-host>...")
 		}
 		for _, h := range args[1:] {
-			if !hasString(hosts, h) {
-				hosts = append(hosts, h)
+			if !hasString(f.Hosts, h) {
+				f.Hosts = append(f.Hosts, h)
 			}
 		}
 	case "rm", "remove":
@@ -118,19 +215,27 @@ func cmdFleet(args []string) int {
 			return errf("usage: gcpx fleet rm <ssh-host>...")
 		}
 		var keep []string
-		for _, h := range hosts {
+		for _, h := range f.Hosts {
 			if !hasString(args[1:], h) {
 				keep = append(keep, h)
 			}
 		}
-		hosts = keep
+		f.Hosts = keep
+		if hasString(args[1:], f.Self) {
+			f.Self = ""
+		}
 	default:
-		return errf("usage: gcpx fleet [ls | add <ssh-host> | rm <ssh-host>]")
+		return errf("usage: gcpx fleet [ls | discover | self <name> | add <ssh-host> | rm <ssh-host>]")
 	}
-	if err := saveFleet(hosts); err != nil {
+	if err := saveFleet(f); err != nil {
 		return errf("%v", err)
 	}
-	fmt.Printf("fleet: %s\n", dash(strings.Join(hosts, ", ")))
+	fmt.Printf("peers: %s\n", dash(strings.Join(f.Hosts, ", ")))
+	if f.Self != "" {
+		fmt.Printf("this host: %s\n", f.Self)
+	} else {
+		warnf("set this host's own name so push can skip it: gcpx fleet self <name>")
+	}
 	return 0
 }
 

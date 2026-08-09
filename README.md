@@ -55,7 +55,7 @@ gcpx exec work -- bq query 'select 1'
 | `archive <alias>` / `rm <alias>` | retire, or delete |
 | `export <alias>` / `import --bundle F` | move an identity to another host, sealed |
 | `push <alias> [--to h1,h2]` | re-sync this credential to the other hosts that hold it |
-| `fleet [ls\|add\|rm] <ssh-host>` | which hosts mirror these identities |
+| `fleet [ls\|discover\|self\|add\|rm]` | peers that mirror these identities |
 | `schedule install\|uninstall\|status` | background refresh via crontab |
 | `self-update [--check]` | replace this binary with the latest release |
 
@@ -132,12 +132,15 @@ gcpx set work --quota-project auto
 
 Mint once, distribute the file. Refresh tokens are portable, and Google caps them at 100 per account per OAuth client, silently invalidating the oldest past that — so minting separately on every host burns slots for no benefit.
 
-Register the hosts once, then one command keeps them in step:
+Learn the peers once, then one command keeps them in step:
 
 ```bash
-gcpx fleet add box-a box-b       # ssh destinations, no secrets stored
-gcpx push work                   # stream the live credential to each
+gcpx fleet discover              # probe ~/.ssh/config for hosts running gcpx
+gcpx fleet self box-a            # what the others call this machine
+gcpx push work                   # stream the live credential to each peer
 ```
+
+There is no coordinating node and no shared registry. Each machine keeps its own list of who it can reach and what the others call it, which is the only state a peer-to-peer copy needs. `discover` builds that list from the ssh config the operator already maintains; `self` exists because an ssh destination is a human's name for a box and almost never matches the box's own hostname — without it a host cannot tell which entry in the list is itself.
 
 `push` streams an unsealed bundle over ssh stdin. Nothing is written to disk on either end and no passphrase appears on a remote command line, where any local `ps` would read it — ssh is already the encrypted channel, so a second layer would only move the secret somewhere worse.
 
